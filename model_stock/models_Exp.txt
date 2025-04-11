@@ -1,0 +1,4 @@
+model_1 - SEB
+model_2 - Cross Modal Attention
+model_3 - RGB disabled  Depth + Lidar(lorcon-lo pretraiend) 
+model_4 - RGB disabled  Depth(monodepth2 pretrained) + Lidar(lorcon-lo pretraiend) 
