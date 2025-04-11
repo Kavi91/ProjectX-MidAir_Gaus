@@ -9,7 +9,6 @@ from torch.utils.data.sampler import Sampler
 from torchvision import transforms
 import time
 import pickle
-import random
 from params import par
 from helper import normalize_angle_delta, euler_to_rotation_matrix, to_ned_pose
 
@@ -184,7 +183,7 @@ def get_data_info(climate_sets, seq_len, overlap, sample_times=1, pad_y=False, s
 
 def get_partition_data_info(partition, climate_sets, seq_len, overlap, sample_times=1, pad_y=False, shuffle=False, sort=True):
     return get_data_info(climate_sets, seq_len, overlap, sample_times, pad_y, shuffle, sort)
-
+    
 class SortedRandomBatchSampler(Sampler):
     def __init__(self, info_dataframe, batch_size, drop_last=False):
         self.df = info_dataframe
@@ -331,10 +330,23 @@ class ImageSequenceDataset(Dataset):
                 pickle.dump(stats, f)
             print(f"Saved dataset statistics to {stats_pickle_path}")
 
-        # Compute mean image for temporal dropout
-        self.mean_image_03 = torch.tensor(img_means_03).float().view(3, 1, 1)
-        self.mean_image_02 = torch.tensor(img_means_02).float().view(3, 1, 1)
-        self.mean_depth = torch.tensor(self.depth_mean / self.depth_max).float().view(1, 1, 1)
+        # Transformation pipeline (with optional augmentation)
+        transform_ops = []
+        if is_training:
+            transform_ops.extend([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            ])
+        if resize_mode == 'crop':
+            transform_ops.append(transforms.CenterCrop((new_size[0], new_size[1])))
+        elif resize_mode == 'rescale':
+            transform_ops.append(transforms.Resize((new_size[0], new_size[1])))
+        transform_ops.append(transforms.ToTensor())
+        self.transformer = transforms.Compose(transform_ops)
+        self.minus_point_5 = minus_point_5
+        self.normalizer_03 = transforms.Normalize(mean=img_means_03, std=img_stds_03)
+        self.normalizer_02 = transforms.Normalize(mean=img_means_02, std=img_stds_02)
+        self.normalizer_depth = transforms.Normalize(mean=(self.depth_mean / self.depth_max,), std=(self.depth_std / self.depth_max,))
 
         self.data_info = info_dataframe
         self.seq_len_list = list(self.data_info.seq_len)
@@ -345,51 +357,7 @@ class ImageSequenceDataset(Dataset):
         self.gps_arr = np.asarray(self.data_info.gps_path)
         self.groundtruth_arr = np.asarray(self.data_info.pose)
 
-        self.resize_mode = resize_mode
-        self.new_size = new_size
-        self.minus_point_5 = minus_point_5
-        self.is_training = is_training
-        self.normalizer_03 = transforms.Normalize(mean=img_means_03, std=img_stds_03)
-        self.normalizer_02 = transforms.Normalize(mean=img_means_02, std=img_stds_02)
-        self.normalizer_depth = transforms.Normalize(mean=(self.depth_mean / self.depth_max,), std=(self.depth_std / self.depth_max,))
-
-    def transform(self, img, resize_mode, new_size, minus_point_5, color_jitter=None, rotation=None):
-        if isinstance(img, np.ndarray):
-            img = Image.fromarray(img)
-        
-        if self.is_training:
-            # Apply the provided color jitter transform (same for all frames in a sequence)
-            img = color_jitter(img)
-            # Apply the provided rotation transform (same for all frames in a sequence)
-            if rotation is not None:
-                img = rotation(img)
-
-        if resize_mode == 'crop':
-            img = transforms.Resize(new_size[0])(img)
-            img = transforms.CenterCrop(new_size)(img)
-        else:
-            img = transforms.Resize(new_size)(img)
-
-        img = transforms.ToTensor()(img)
-        if minus_point_5:
-            img = img - 0.5
-        return img
-
-    def transform_depth(self, depth, resize_mode, new_size, rotation=None):
-        if isinstance(depth, np.ndarray):
-            depth = Image.fromarray(depth)
-        
-        if self.is_training and rotation is not None:
-            depth = rotation(depth)
-
-        if resize_mode == 'crop':
-            depth = transforms.Resize(new_size[0])(depth)
-            depth = transforms.CenterCrop(new_size)(depth)
-        else:
-            depth = transforms.Resize(new_size)(depth)
-
-        depth = transforms.ToTensor()(depth)
-        return depth
+    # Rest of the class (__getitem__, __len__) remains unchanged
 
     def __getitem__(self, index):
         raw_groundtruth = self.groundtruth_arr[index]
@@ -421,60 +389,15 @@ class ImageSequenceDataset(Dataset):
         gps_path_info = self.gps_arr[index]
         sequence_len = torch.tensor(self.seq_len_list[index])
         expected_len = len(image_path_sequence_03)
-
-        # Initialize sequence-level augmentations
-        if self.is_training:
-            # Color jitter (consistent across sequence)
-            color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
-            # Random rotation (small angles, ±5 degrees, consistent across sequence)
-            rotation_angle = random.uniform(-5, 5)  # Degrees
-            rotation = transforms.RandomRotation(degrees=(rotation_angle, rotation_angle))
-            # Temporal dropout (20% chance to mask one frame)
-            do_dropout = random.random() < 0.2
-            if do_dropout:
-                dropout_idx = random.randint(0, expected_len - 1)  # Frame to mask
-            else:
-                dropout_idx = -1
-        else:
-            color_jitter = lambda x: x
-            rotation = None
-            dropout_idx = -1
-
-        # Transform for image_03 (left)
-        image_sequence_03 = []
-        for i, img_path in enumerate(image_path_sequence_03):
-            if i == dropout_idx:
-                # Replace with mean image
-                img = torch.ones(3, self.new_size[0], self.new_size[1]) * self.mean_image_03
-            else:
-                img = self.transform(Image.open(img_path), self.resize_mode, self.new_size, self.minus_point_5, color_jitter=color_jitter, rotation=rotation)
-                # Add Gaussian noise (consistent across sequence)
-                if self.is_training:
-                    noise = torch.randn_like(img) * 0.01  # Small noise (std=0.01)
-                    img = img + noise
-                    img = torch.clamp(img, 0, 1)  # Ensure values stay in [0, 1]
-            image_sequence_03.append(img.unsqueeze(0))
-        image_sequence_03 = torch.cat(image_sequence_03, 0)
-        image_sequence_03 = self.normalizer_03(image_sequence_03)
         
-        # Transform for image_02 (right)
-        image_sequence_02 = []
-        for i, img_path in enumerate(image_path_sequence_02):
-            if i == dropout_idx:
-                # Replace with mean image
-                img = torch.ones(3, self.new_size[0], self.new_size[1]) * self.mean_image_02
-            else:
-                img = self.transform(Image.open(img_path), self.resize_mode, self.new_size, self.minus_point_5, color_jitter=color_jitter, rotation=rotation)
-                # Add Gaussian noise (consistent across sequence)
-                if self.is_training:
-                    noise = torch.randn_like(img) * 0.01  # Same noise as image_03
-                    img = img + noise
-                    img = torch.clamp(img, 0, 1)
-            image_sequence_02.append(img.unsqueeze(0))
+        image_sequence_03 = [self.normalizer_03(self.transformer(Image.open(img_path)) - (0.5 if self.minus_point_5 else 0)).unsqueeze(0)
+                             for img_path in image_path_sequence_03]
+        image_sequence_03 = torch.cat(image_sequence_03, 0)
+        
+        image_sequence_02 = [self.normalizer_02(self.transformer(Image.open(img_path)) - (0.5 if self.minus_point_5 else 0)).unsqueeze(0)
+                             for img_path in image_path_sequence_02]
         image_sequence_02 = torch.cat(image_sequence_02, 0)
-        image_sequence_02 = self.normalizer_02(image_sequence_02)
-
-        # Transform for depth
+        
         if par.enable_depth:
             depth_sequence = []
             if len(depth_path_sequence) != expected_len:
@@ -484,28 +407,23 @@ class ImageSequenceDataset(Dataset):
                     depth_path_sequence = depth_path_sequence[:expected_len]
                 else:
                     depth_path_sequence.extend([None] * (expected_len - len(depth_path_sequence)))
-            for i, depth_path in enumerate(depth_path_sequence):
-                if i == dropout_idx:
-                    # Replace with mean depth
-                    depth = torch.ones(1, self.new_size[0], self.new_size[1]) * self.mean_depth
+            for depth_path in depth_path_sequence:
+                if depth_path is None or not os.path.exists(depth_path):
+                    depth_as_tensor = torch.zeros((1, par.img_h, par.img_w))
                 else:
-                    if depth_path is None or not os.path.exists(depth_path):
-                        depth = torch.zeros((1, self.new_size[0], self.new_size[1]))
-                    else:
-                        depth_img = Image.open(depth_path)
-                        depth_array = np.array(depth_img, dtype=np.uint16)
-                        depth_float16 = depth_array.view(np.float16)
-                        depth_map = depth_float16.astype(np.float32)
-                        depth_map = depth_map * (self.depth_max / 65535.0)
-                        depth = torch.from_numpy(depth_map).float() / self.depth_max
-                        depth = self.transform_depth(depth, self.resize_mode, self.new_size, rotation=rotation)
-                        depth = self.normalizer_depth(depth)
-                depth_sequence.append(depth.unsqueeze(0))
+                    depth_img = Image.open(depth_path)
+                    depth_array = np.array(depth_img, dtype=np.uint16)
+                    depth_float16 = depth_array.view(np.float16)
+                    depth_map = depth_float16.astype(np.float32)
+                    depth_map = depth_map * (self.depth_max / 65535.0)
+                    depth_as_tensor = torch.from_numpy(depth_map).float() / self.depth_max
+                    depth_as_tensor = transforms.Resize((par.img_h, par.img_w))(depth_as_tensor.unsqueeze(0))
+                    depth_as_tensor = self.normalizer_depth(depth_as_tensor)
+                depth_sequence.append(depth_as_tensor.unsqueeze(0))
             depth_sequence = torch.cat(depth_sequence, 0)
         else:
-            depth_sequence = torch.zeros((expected_len, 1, self.new_size[0], self.new_size[1]))
+            depth_sequence = torch.zeros((expected_len, 1, par.img_h, par.img_w))
 
-        # Adjust IMU and GPS for rotation
         if par.enable_imu:
             imu_path, start_idx, end_idx = imu_path_info if imu_path_info else (None, 0, 0)
             if not imu_path or not os.path.exists(imu_path):
@@ -513,7 +431,7 @@ class ImageSequenceDataset(Dataset):
             else:
                 imu_data = np.load(imu_path)[start_idx:end_idx]  # [ax, ay, az, wx, wy, wz]
                 imu_data = torch.tensor(imu_data, dtype=torch.float32)
-                # Convert IMU to NED convention
+                # Convert IMU to NED convention: mapping axes explicitly
                 imu_data_ned = imu_data.clone()
                 imu_data_ned[:, 0] = imu_data[:, 2]
                 imu_data_ned[:, 1] = imu_data[:, 1]
@@ -526,24 +444,6 @@ class ImageSequenceDataset(Dataset):
                 imu_acc_tensor = (imu_acc - self.imu_acc_mean) / self.imu_acc_std
                 imu_gyro_tensor = (imu_gyro - self.imu_gyro_mean) / self.imu_gyro_std
                 imu_sequence = torch.cat((imu_acc_tensor, imu_gyro_tensor), dim=1)
-
-                # Adjust IMU for rotation
-                if self.is_training and rotation is not None:
-                    # Convert rotation angle to radians
-                    angle_rad = torch.tensor(rotation_angle * np.pi / 180.0)
-                    # Rotation matrix around Z-axis (yaw)
-                    cos_a = torch.cos(angle_rad)
-                    sin_a = torch.sin(angle_rad)
-                    R = torch.tensor([
-                        [cos_a, -sin_a, 0],
-                        [sin_a, cos_a, 0],
-                        [0, 0, 1]
-                    ], dtype=torch.float32)
-                    # Rotate IMU angular velocities (wx, wy, wz)
-                    imu_angular = imu_sequence[:, 3:6]  # wx, wy, wz
-                    imu_angular_rotated = torch.matmul(imu_angular, R.T)
-                    imu_sequence[:, 3:6] = imu_angular_rotated
-
             if imu_sequence.size(0) != expected_len:
                 print(f"Warning: IMU sequence length ({imu_sequence.size(0)}) does not match RGB ({expected_len}) at index {index}. Adjusting.")
                 if imu_sequence.size(0) > expected_len:
@@ -567,24 +467,6 @@ class ImageSequenceDataset(Dataset):
                 gps_pos_tensor = (gps_pos - self.gps_pos_mean) / self.gps_pos_std
                 gps_vel_tensor = (gps_vel - self.gps_vel_mean) / self.gps_vel_std
                 gps_sequence = torch.cat((gps_pos_tensor, gps_vel_tensor), dim=1)
-
-                # Adjust GPS for rotation
-                if self.is_training and rotation is not None:
-                    # Convert rotation angle to radians
-                    angle_rad = torch.tensor(rotation_angle * np.pi / 180.0)
-                    # Rotation matrix around Z-axis (yaw)
-                    cos_a = torch.cos(angle_rad)
-                    sin_a = torch.sin(angle_rad)
-                    R = torch.tensor([
-                        [cos_a, -sin_a, 0],
-                        [sin_a, cos_a, 0],
-                        [0, 0, 1]
-                    ], dtype=torch.float32)
-                    # Rotate GPS positions (x, y, z)
-                    gps_pos = gps_sequence[:, :3]
-                    gps_pos_rotated = torch.matmul(gps_pos, R.T)
-                    gps_sequence[:, :3] = gps_pos_rotated
-
             if gps_sequence.size(0) != expected_len:
                 print(f"Warning: GPS sequence length ({gps_sequence.size(0)}) does not match RGB ({expected_len}) at index {index}. Adjusting.")
                 if gps_sequence.size(0) > expected_len:
@@ -600,7 +482,7 @@ class ImageSequenceDataset(Dataset):
 
     def __len__(self):
         return len(self.data_info.index)
-
+        
 if __name__ == '__main__':
     start_t = time.time()
     overlap = 1
